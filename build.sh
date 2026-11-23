@@ -65,6 +65,13 @@ echo ""
 # ========== 生成 .env（首次） ==========
 generate_env() {
     if [ -f "$ENV_FILE" ]; then
+        # 只补齐缺失项，保留已有网段、代理地址和用户信任配置。
+        for proxy_setting in 'XIANYU_NETWORK_SUBNET=172.30.56.0/24' 'FRONTEND_IPV4_ADDRESS=172.30.56.10' 'TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128,${FRONTEND_IPV4_ADDRESS}/32'; do
+            proxy_key=${proxy_setting%%=*}
+            if ! grep -qE "^[[:space:]]*(export[[:space:]]+)?${proxy_key}[[:space:]]*=" "$ENV_FILE"; then
+                printf '\n%s\n' "$proxy_setting" >> "$ENV_FILE"
+            fi
+        done
         return
     fi
     echo -e "${YELLOW}[提示] 首次构建，生成默认 .env 配置${NC}"
@@ -78,21 +85,57 @@ MYSQL_ROOT_PASSWORD=xianyu@2026
 MYSQL_DATABASE=xianyu_data
 MYSQL_USER=xianyu
 MYSQL_PASSWORD=xianyu@2026
+MYSQL_MAX_CONNECTIONS=4000
+
+# 数据库连接池（三个服务峰值合计 2640，低于 MySQL 最大连接数并预留管理连接）
+BACKEND_DB_POOL_SIZE=800
+BACKEND_DB_MAX_OVERFLOW=60
+WEBSOCKET_DB_POOL_SIZE=800
+WEBSOCKET_DB_MAX_OVERFLOW=150
+SCHEDULER_DB_POOL_SIZE=800
+SCHEDULER_DB_MAX_OVERFLOW=30
+DB_POOL_TIMEOUT=30
+DB_POOL_RECYCLE=1800
+DB_POOL_PRE_PING=true
+DB_POOL_USE_LIFO=true
+DB_CONNECT_TIMEOUT=10
 
 # Redis
 REDIS_PASSWORD=xianyu@2026
 REDIS_DB=0
+REDIS_POOL_SIZE=800
+REDIS_SOCKET_TIMEOUT=5
+REDIS_SOCKET_CONNECT_TIMEOUT=3
+REDIS_SOCKET_KEEPALIVE=true
+REDIS_SOCKET_KEEPALIVE_IDLE=60
+REDIS_SOCKET_KEEPALIVE_INTERVAL=10
+REDIS_SOCKET_KEEPALIVE_COUNT=3
+REDIS_HEALTH_CHECK_INTERVAL=30
+REDIS_PROTOCOL=2
+REDIS_STARTUP_MAX_RETRIES=5
+REDIS_STARTUP_RETRY_BASE_DELAY=1
+REDIS_STARTUP_RETRY_CAP_DELAY=10
 
 # 说明：JWT 密钥由数据库统一托管（首次启动自动生成并持久化），无需在此配置
 
 # 端口
 FRONTEND_PORT=9000
+XIANYU_NETWORK_SUBNET=172.30.56.0/24
+FRONTEND_IPV4_ADDRESS=172.30.56.10
+TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128,${FRONTEND_IPV4_ADDRESS}/32
 BACKEND_WEB_PORT=8089
 WEBSOCKET_PORT=8090
 SCHEDULER_PORT=8091
 
 # 日志级别
 LOG_LEVEL=INFO
+LOG_FILE_MAX_SIZE=70 MB
+
+# 在线安装：SSH 连接超时、脚本执行上限和任务日志保留期（秒）
+ONLINE_INSTALL_CONNECT_TIMEOUT=60
+ONLINE_INSTALL_TIMEOUT=7200
+ONLINE_INSTALL_RETENTION_SECONDS=86400
+CARD_REQUEST_MAX_BYTES=52428800
 
 # Token过期时间（分钟）
 ACCESS_TOKEN_EXPIRE_MINUTES=1440
@@ -175,10 +218,10 @@ start_services() {
     echo "==========================================${NC}"
     echo ""
     echo "服务访问地址："
-    echo "  前端:         http://localhost:9000"
-    echo "  Backend-Web:  http://localhost:8089"
-    echo "  WebSocket:    http://localhost:8090"
-    echo "  Scheduler:    http://localhost:8091"
+    frontend_port=$(grep -E '^FRONTEND_PORT=' "$ENV_FILE" | cut -d '=' -f2 | tr -d '\r')
+    echo "  宿主机反代目标: http://127.0.0.1:${frontend_port:-9000}"
+    echo "  后端 / WebSocket / Scheduler: 仅项目容器网络访问"
+    echo "  公网访问: 请通过宿主机 Nginx / 宝塔域名入口"
     echo ""
     echo "默认账号: admin / admin123"
     echo ""

@@ -14,7 +14,7 @@ dependencies = [
     "pydantic-settings>=2.1.0",
     "aiohttp>=3.9.0",
     "requests>=2.31.0",
-    "redis>=5.0.0",
+    "redis==6.2.0",
     "loguru>=0.7.2",
     "apscheduler>=3.10.0",
     "anyio>=4.0.0",
@@ -30,6 +30,9 @@ dependencies = [
     "bcrypt==5.0.0",
     "playwright",
     "Pillow>=10.0.0",
+    # 公共单品发布的图片/视频模块依赖，与网页后端保持一致。
+    "pycryptodome>=3.19.0",
+    "opencv-python-headless>=4.10.0",
 ]
 
 [build-system]

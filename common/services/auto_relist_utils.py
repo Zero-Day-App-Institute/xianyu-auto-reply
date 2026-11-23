@@ -8,6 +8,7 @@ import hashlib
 from typing import Any
 
 from common.models.product_material import ProductMaterial
+from common.services.order_delivery_result import has_incomplete_delivery
 from common.utils.time_utils import BEIJING_TZ
 
 
@@ -19,6 +20,9 @@ def material_to_publish_data(material: ProductMaterial) -> dict[str, Any]:
         "title": material.title,
         "description": material.description,
         "price": float(material.price or 0),
+        "price_mode": material.price_mode or "fixed",
+        "price_min": float(material.price_min) if material.price_min is not None else None,
+        "price_max": float(material.price_max) if material.price_max is not None else None,
         "original_price": float(material.original_price) if material.original_price is not None else None,
         "category": material.category,
         "platform_category_id": material.platform_category_id,
@@ -66,6 +70,8 @@ def build_publish_request_id(rule_id: int, order_no: str, old_item_id: str) -> s
 
 def order_still_eligible(order: Any) -> bool:
     """判断订单当前状态是否仍满足自动续售触发条件。"""
+    if has_incomplete_delivery(order):
+        return False
     has_content = bool(str(order.delivery_content or "").strip())
     normal_delivery = (
         order.status in {"shipped", "completed"}

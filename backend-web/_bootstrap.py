@@ -28,7 +28,16 @@ from loguru import logger
 from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
+from app.services.db_backup_log_service import DbBackupLogService
+from app.services.system_setting_service import SystemSettingService
+from common.core.request_origin_log import RequestOriginLoggingMiddleware
 from common.db.error_messages import get_public_database_error_message
+from common.db.init_database import init_database
+from common.db.redis_client import close_redis_client, initialize_redis_client
+from common.db.session import async_engine, async_session_maker
+from common.services.audit_writer import report_safely
+from common.services.security_frequency_lifecycle import run_security_frequency, stop_security_frequency
+from common.utils.async_cleanup import complete_before_cancellation
 from common.utils.logging_utils import setup_logging
 from common.utils.network_utils import resolve_listen_host
 
@@ -77,13 +86,33 @@ async def lifespan(app: FastAPI):
     if not await check_database_connection():
         logger.error("数据库连接失败，服务退出")
         sys.exit(1)
+
+    # 初始化 Redis 健康连接池；失败时按指数退避重试，最终失败则停止启动。
+    try:
+        await initialize_redis_client()
+    except Exception:
+        logger.exception("Redis连接初始化失败，服务退出")
+        raise
     
     # 初始化数据库（创建表、默认数据等）
     try:
-        from common.db.init_database import init_database
         await init_database()
-    except Exception as e:
-        logger.error(f"数据库初始化失败: {e}")
+        async with async_session_maker() as session:
+            await SystemSettingService(session).ensure_default_settings()
+    except Exception:
+        logger.exception("数据库初始化失败，服务退出")
+        try:
+            await close_redis_client()
+        except Exception:
+            logger.exception("数据库初始化失败后关闭Redis连接失败")
+        raise
+
+    # 删除备份日志时会暂存文件，启动时检查进程退出前是否留下未完成的暂存文件。
+    try:
+        async with async_session_maker() as session:
+            await DbBackupLogService(session).recover_staged_files()
+    except Exception:
+        logger.exception("恢复数据库备份删除中断时遗留的暂存文件失败")
     
     # 自检 JWT 密钥：弱/默认值时自动生成强随机密钥并持久化（源码启动兜底）
     try:
@@ -139,40 +168,68 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("已禁用自动启动Goofish定时采集任务（AUTO_START_CRAWL_JOBS=false）")
     
-    yield
-    
-    logger.info(f"{settings.project_name} 关闭中...")
-    
-    # 停止所有在线聊天IM会话
+    security_stop = asyncio.Event()
+    security_worker = asyncio.create_task(run_security_frequency(security_stop))
     try:
-        from app.services.chat_new import get_im_session_manager
-        chat_manager = get_im_session_manager()
-        await chat_manager.disconnect_all()
-        logger.info("所有在线聊天IM会话已停止")
-    except Exception as e:
-        logger.error(f"停止在线聊天IM会话失败: {e}")
-    
-    # 停止 Goofish 定时采集任务
-    try:
-        await stop_goofish_crawl_jobs()
-    except Exception as e:
-        logger.error(f"停止 Goofish 定时采集任务失败: {e}")
-    
-    # 关闭HTTP客户端
-    from app.core.http_client import close_http_client
-    await close_http_client()
-    logger.info("HTTP客户端已关闭")
+        yield
+    finally:
+        cancellation = None
+        shutdown_error = None
+        try:
+            await stop_security_frequency(security_stop, security_worker)
+        except asyncio.CancelledError as exc:
+            # 排空方法完成必要审计后才传播取消，继续释放资源后再恢复取消语义。
+            cancellation = exc
+        except Exception as exc:
+            # 自动循环已经结束并排空审计后发生的关闭异常，不能跳过其他资源的释放。
+            shutdown_error = exc
+            report_safely('安全检查关闭失败，继续释放资源', exc)
+        try:
+            logger.info(f"{settings.project_name} 关闭中...")
 
-    # 关闭复用的 goofish API 连接池
-    from common.services.order_service import close_goofish_connector
-    await close_goofish_connector()
-    logger.info("goofish API 连接池已关闭")
+            # 停止所有在线聊天IM会话
+            try:
+                from app.services.chat_new import get_im_session_manager
+                chat_manager = get_im_session_manager()
+                await chat_manager.disconnect_all()
+                logger.info("所有在线聊天IM会话已停止")
+            except Exception as e:
+                logger.error(f"停止在线聊天IM会话失败: {e}")
 
-    log_retention_sync_task.cancel()
-    try:
-        await log_retention_sync_task
-    except asyncio.CancelledError:
-        pass
+            # 停止 Goofish 定时采集任务
+            try:
+                await stop_goofish_crawl_jobs()
+            except Exception as e:
+                logger.error(f"停止 Goofish 定时采集任务失败: {e}")
+
+            # 关闭HTTP客户端
+            from app.core.http_client import close_http_client
+            await close_http_client()
+            logger.info("HTTP客户端已关闭")
+
+            # 关闭复用的 goofish API 连接池
+            from common.services.order_service import close_goofish_connector
+            await close_goofish_connector()
+            logger.info("goofish API 连接池已关闭")
+
+            # 先释放Redis客户端，再断开全局连接池
+            try:
+                await close_redis_client()
+            except Exception:
+                logger.exception("关闭Redis连接失败")
+
+            log_retention_sync_task.cancel()
+            try:
+                await log_retention_sync_task
+            except asyncio.CancelledError:
+                pass
+        finally:
+            # 审计已排空；资源关闭异常或再次取消也必须等待统一数据库引擎释放。
+            await complete_before_cancellation(async_engine.dispose(), operation='关闭安全任务后释放数据库引擎')
+            if cancellation is not None:
+                raise cancellation
+            if shutdown_error is not None:
+                raise shutdown_error
 
 
 async def start_goofish_crawl_jobs():
@@ -232,6 +289,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(RequestOriginLoggingMiddleware)
 
 # 挂载静态文件目录
 static_path = Path(settings.static_dir)
@@ -393,6 +451,7 @@ def run_server():
         host=listen_host,
         port=settings.service_port,
         reload=False,
+        proxy_headers=False,
         log_level=settings.log_level.lower(),
         # 保留公共日志工具配置，确保 Uvicorn 日志也进入普通日志和 error.log。
         log_config=None,

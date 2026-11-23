@@ -10,10 +10,29 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from ipaddress import IPv4Network, IPv6Network, ip_network
 from urllib.parse import quote_plus
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+@lru_cache(maxsize=32)
+def parse_trusted_proxy_cidrs(value: str) -> tuple[IPv4Network | IPv6Network, ...]:
+    """校验可信代理配置；参数为逗号分隔的 CIDR，返回规范化网段，空值表示不信任代理。"""
+    if not value.strip():
+        return ()
+    networks = []
+    for item in value.split(","):
+        try:
+            network = ip_network(item.strip(), strict=False)
+        except ValueError as exc:
+            raise ValueError("TRUSTED_PROXY_CIDRS 必须为逗号分隔的合法 IPv4/IPv6 网段") from exc
+        if network.prefixlen == 0:
+            raise ValueError("TRUSTED_PROXY_CIDRS 禁止信任全部地址（0.0.0.0/0 或 ::/0）")
+        if network not in networks:
+            networks.append(network)
+    return tuple(networks)
 
 
 class BaseConfig(BaseSettings):
@@ -33,6 +52,18 @@ class BaseConfig(BaseSettings):
     # 环境配置
     environment: str = Field(default="development")
     log_level: str = Field(default="INFO")
+    log_file_max_size: str = Field(default='70 MB', min_length=1)
+
+    # 本机默认仅信任 loopback；Docker 由 Compose 注入实际前端代理的单地址网段。
+    trusted_proxy_cidrs: str = Field(
+        default="127.0.0.1/32,::1/128", alias="TRUSTED_PROXY_CIDRS"
+    )
+
+    @field_validator("trusted_proxy_cidrs")
+    @classmethod
+    def validate_trusted_proxy_cidrs(cls, value: str) -> str:
+        """启动时验证可信代理网段；返回规范化配置，非法或全网可信配置明确报错。"""
+        return ",".join(str(network) for network in parse_trusted_proxy_cidrs(value))
 
     # SQL 日志开关：开启后会在每条 SQL 执行前打印拼接好参数的完整 SQL。
     # 默认开启，便于开发与 Docker 环境排查；高并发生产环境如需降低开销可设为 false。
@@ -48,11 +79,9 @@ class BaseConfig(BaseSettings):
     async_driver: str = Field(default="mysql+asyncmy")
 
     # 数据库连接池配置（账号数量较大时可通过环境变量调优）
-    # 重要：db_pool_size + db_max_overflow 不应超过 MySQL 的 max_connections，
-    # 否则连接池打满后还会触发 MySQL 的 "Too many connections"。
-    # 上千账号场景的建议：保持适中的连接池 + 短连接超时，让卡住的连接快速失败并归还，
-    # 而不是无限放大连接数把远程 MySQL 压垮。
-    db_pool_size: int = Field(default=30)            # 常驻连接数
+    # MySQL max_connections 必须大于所有服务进程的连接峰值总和并预留管理连接。
+    # 主服务默认峰值合计 2640；启用推广服务后为 3460，部署默认上限为 4000。
+    db_pool_size: int = Field(default=800, ge=600)   # 连接池容量，连接按需建立
     db_max_overflow: int = Field(default=70)         # 允许的溢出连接数（峰值 = pool_size + max_overflow）
     db_pool_timeout: int = Field(default=30)         # 从连接池获取连接的最长等待秒数
     db_pool_recycle: int = Field(default=1800)       # 连接回收时间（秒），防止 MySQL 主动断开陈旧连接
@@ -65,6 +94,38 @@ class BaseConfig(BaseSettings):
     redis_port: int = Field(default=6379)
     redis_password: str = Field(default="", repr=False)
     redis_db: int = Field(default=0)
+    redis_pool_size: int = Field(default=800, alias="REDIS_POOL_SIZE", ge=600)
+    redis_socket_timeout: float = Field(
+        default=5.0, alias="REDIS_SOCKET_TIMEOUT", gt=0
+    )
+    redis_socket_connect_timeout: float = Field(
+        default=3.0, alias="REDIS_SOCKET_CONNECT_TIMEOUT", gt=0
+    )
+    redis_socket_keepalive: bool = Field(
+        default=True, alias="REDIS_SOCKET_KEEPALIVE"
+    )
+    redis_socket_keepalive_idle: int = Field(
+        default=60, alias="REDIS_SOCKET_KEEPALIVE_IDLE", ge=1
+    )
+    redis_socket_keepalive_interval: int = Field(
+        default=10, alias="REDIS_SOCKET_KEEPALIVE_INTERVAL", ge=1
+    )
+    redis_socket_keepalive_count: int = Field(
+        default=3, alias="REDIS_SOCKET_KEEPALIVE_COUNT", ge=1
+    )
+    redis_health_check_interval: int = Field(
+        default=30, alias="REDIS_HEALTH_CHECK_INTERVAL", ge=0
+    )
+    redis_protocol: int = Field(default=2, alias="REDIS_PROTOCOL", ge=2, le=3)
+    redis_startup_max_retries: int = Field(
+        default=5, alias="REDIS_STARTUP_MAX_RETRIES", ge=0, le=20
+    )
+    redis_startup_retry_base_delay: float = Field(
+        default=1.0, alias="REDIS_STARTUP_RETRY_BASE_DELAY", gt=0
+    )
+    redis_startup_retry_cap_delay: float = Field(
+        default=10.0, alias="REDIS_STARTUP_RETRY_CAP_DELAY", gt=0
+    )
     
     # JWT配置（用于安全模块）
     # 注意：jwt_secret_key 由数据库统一托管（backend-web 启动时自动生成并持久化），

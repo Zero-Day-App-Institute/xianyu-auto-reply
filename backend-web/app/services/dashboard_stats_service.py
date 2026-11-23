@@ -20,6 +20,7 @@ from app.core.config import get_settings
 from app.core.http_client import get_http_client
 from app.services.auto_reply_stats_service import AutoReplyStatsService
 from app.services.dashboard_stats_cache_service import DashboardStatsCacheService
+from app.services.dashboard_totals_service import build_dashboard_totals_statement
 from common.models.agent_order import AgentOrder
 from common.models.card import Card
 from common.models.user import User
@@ -139,11 +140,7 @@ class DashboardStatsService:
     async def _load_admin_dashboard_bundle(self) -> dict[str, dict[str, int | float]]:
         today_start = self._build_today_start()
 
-        users_stmt = select(func.count()).select_from(User)
-        total_users = int((await self.session.execute(users_stmt)).scalar() or 0)
-
-        accounts_stmt = select(
-            func.count().label("total_accounts"),
+        accounts_stmt = build_dashboard_totals_statement().add_columns(
             func.coalesce(
                 func.sum(
                     case(
@@ -168,7 +165,7 @@ class DashboardStatsService:
                 ),
                 0,
             ).label("password_configured"),
-        ).select_from(XYAccount)
+        )
         accounts_row = (await self.session.execute(accounts_stmt)).one()
 
         keywords_stmt = select(func.count()).select_from(XYKeywordRule)
@@ -187,7 +184,7 @@ class DashboardStatsService:
         ).select_from(XYOrder)
         orders_row = (await self.session.execute(orders_stmt)).one()
 
-        cards_stmt = select(func.count()).select_from(Card)
+        cards_stmt = select(func.count()).select_from(Card).where(Card.is_deleted.is_(False))
         total_cards = int((await self.session.execute(cards_stmt)).scalar() or 0)
 
         reply_stats = await AutoReplyStatsService(self.session).get_today_and_yesterday_success_reply_counts()
@@ -214,7 +211,7 @@ class DashboardStatsService:
 
         return {
             "admin_stats": {
-                "total_users": total_users,
+                "total_users": int(accounts_row.total_users),
                 "total_cookies": int(accounts_row.total_accounts or 0),
                 "active_cookies": int(accounts_row.active_accounts or 0),
                 "total_keywords": total_keywords,

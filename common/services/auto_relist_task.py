@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 
 from common.core.config import get_settings
 from common.db.redis_client import distributed_lock
@@ -22,6 +22,7 @@ from common.models.xy_account import XYAccount
 from common.models.xy_catalog_item import XYCatalogItem
 from common.models.xy_order import XYOrder
 from common.services.item_service import ItemService
+from common.services.product_material_price import resolve_material_publish_price
 from common.services.publish_execution_service import execute_single_publish
 from common.services.auto_relist_lifecycle import AutoRelistLifecycleMixin
 from common.services.auto_relist_utils import (
@@ -108,7 +109,7 @@ class AutoRelistTask(AutoRelistLifecycleMixin, AutoRelistDiscoveryMixin):
             if rule:
                 card = (
                     await session.execute(
-                        select(Card).where(Card.id == rule.card_id, Card.user_id == event.user_id)
+                        select(Card).where(Card.id == rule.card_id, Card.user_id == event.user_id, Card.is_deleted == False)
                     )
                 ).scalars().first()
             if not rule or rule.user_id != event.user_id or rule.material_id != event.material_id:
@@ -152,6 +153,9 @@ class AutoRelistTask(AutoRelistLifecycleMixin, AutoRelistDiscoveryMixin):
                             CardItemRelation.user_id == event.user_id,
                             CardItemRelation.card_id == rule.card_id,
                             CardItemRelation.item_id == event.old_item_id,
+                            CardItemRelation.is_deleted == False,
+                            or_(CardItemRelation.source.is_(None), CardItemRelation.source == "own"),
+                            or_(CardItemRelation.dock_record_id.is_(None), CardItemRelation.dock_record_id == 0),
                         ).limit(1)
                     )
                 ).scalar_one_or_none()
@@ -384,11 +388,14 @@ class AutoRelistTask(AutoRelistLifecycleMixin, AutoRelistDiscoveryMixin):
                 return
             await session.commit()
             await session.refresh(event)
+            publish_data = resolve_material_publish_price(
+                material_to_publish_data(material)
+            )
             result = await execute_single_publish(
                 session=session,
                 user_id=event.user_id,
                 account_id=event.account_id,
-                item_data=material_to_publish_data(material),
+                item_data=publish_data,
                 static_root=Path(self.static_dir),
                 publish_request_id=event.publish_request_id,
                 source_event_id=event.id,

@@ -17,15 +17,27 @@ import hashlib
 import aiohttp
 from decimal import Decimal, InvalidOperation
 from loguru import logger
+from sqlalchemy import select
 
 from app.services.xianyu.delivery_utils import (
     process_delivery_content_with_description,
     replace_order_context_variables as _replace_order_context_variables,
     recursive_replace_params
 )
+from app.services.xianyu.delivery_precheck import DeliveryPrecheckMixin
 from app.services.xianyu.yifan_api_handler import YifanApiHandler
 from common.db.compat import db_manager
-from common.services.order_service import OrderDetailService
+from common.db.session import async_session_maker
+from common.models.agent_order import AgentOrder
+from common.models.card import Card as CardModel
+from common.models.dock_record import DockRecord
+from common.models.system_setting import SystemSetting
+from common.services.card_access import CardAccess
+from common.services.card_consumption_errors import CardConsumptionConfigurationError
+from common.services.agent_delivery_settlement import AgentSettlementCommitUncertainError, record_and_settle_agent_deliveries
+from common.services.order_delivery_result import has_incomplete_delivery
+from common.services.order_service import OrderDetailService, OrderService
+from common.services.settlement_service import SettlementService
 from common.utils.fish_nick_utils import get_buyer_fish_nick
 from common.utils.response_field import extract_card_api_response_content
 from common.utils.xianyu_utils import trans_cookies
@@ -41,7 +53,7 @@ SEND_BEFORE_CONFIRM_WAIT_TIMEOUT = float(os.getenv('SEND_BEFORE_CONFIRM_WAIT_TIM
 DELIVERY_AMOUNT_REFRESH_TIMEOUT = 15.0
 
 
-class AutoDeliveryHandler:
+class AutoDeliveryHandler(DeliveryPrecheckMixin):
     """自动发货处理器"""
     
     def __init__(self, parent):
@@ -499,7 +511,9 @@ class AutoDeliveryHandler:
                                     sender_user_name: str, msg_time: str, order_id: str,
                                     delivery_contents: list, send_results: list,
                                     any_send_failed: bool,
-                                    defer_send_status_writeback: bool = False) -> dict | None:
+                                    defer_send_status_writeback: bool = False,
+                                    *, configuration_stop_reason: str | None = None,
+                                    settlement_fail_reason: str | None = None) -> dict | None:
         """将自动发货的发送结果写入消息日志表
         
         Args:
@@ -516,6 +530,8 @@ class AutoDeliveryHandler:
                 开启“卡券发送成功再确认发货”开关时置 True：不在此起后台回写任务，
                 而是返回上下文（log_service/log_id/待确认的 future），交由确认发货前的
                 同步等待统一判定并回写，避免后台任务与同步等待争用同一个 send_future。
+            configuration_stop_reason: 已取部分卡券后配置中断的原因；业务处理失败与实际发送状态分别记录。
+            settlement_fail_reason: 已取对接卡券结算失败原因，不改变真实消息发送状态。
 
         Returns:
             defer_send_status_writeback=True 且存在待确认 future 时返回回写上下文 dict；
@@ -545,6 +561,10 @@ class AutoDeliveryHandler:
             if any_send_failed:
                 errors = [r.get("error_message", "发送失败") for r in send_results if not r.get("success")]
                 error_message = "；".join(errors[:3]) if errors else "部分消息发送失败"
+            if configuration_stop_reason:
+                error_message = "；".join(filter(None, (configuration_stop_reason, error_message)))
+            if settlement_fail_reason:
+                error_message = "；".join(filter(None, (settlement_fail_reason, error_message)))
 
             # 发送状态：发送层（WebSocket 发送）失败直接判定 failed；
             # 全部发出成功则先置 unknown，由后台任务等服务端响应后回写 success/failed
@@ -565,7 +585,7 @@ class AutoDeliveryHandler:
                 "item_id": item_id or None,
                 "order_no": order_id or None,
                 "msg_time": msg_time,
-                "process_status": "failed" if any_send_failed else "success",
+                "process_status": "failed" if any_send_failed or configuration_stop_reason or settlement_fail_reason else "success",
                 "decision_reason": "auto_delivery",
                 "reply_strategy": "auto_delivery",
                 "reply_mode": "text",
@@ -579,12 +599,20 @@ class AutoDeliveryHandler:
                     "delivery_count": len(delivery_contents),
                     "send_success": success_count,
                     "send_fail": fail_count,
+                    "delivery_configuration_changed": bool(configuration_stop_reason),
+                    "agent_settlement_failed": bool(settlement_fail_reason),
                 },
             }
 
             log_service = AutoReplyLogService(self.cookie_id)
             log_id = await log_service.record_message(log_payload)
-            logger.info(f"【{self.cookie_id}】自动发货消息日志已记录: 成功{success_count}/失败{fail_count}")
+            if log_id:
+                logger.info(f"【{self.cookie_id}】自动发货消息日志已记录: 成功{success_count}/失败{fail_count}")
+            else:
+                logger.error(
+                    f"【{self.cookie_id}】自动发货审计日志写入失败，未生成日志记录: "
+                    f"成功{success_count}/失败{fail_count}"
+                )
 
             # 发出成功且日志写入成功时，处理服务端响应并回写发送状态
             if log_id and not any_send_failed and pending_send_waiters:
@@ -1224,6 +1252,9 @@ class AutoDeliveryHandler:
                     try:
                         from common.db.compat import db_manager
                         existing_order = db_manager.get_order_by_id(order_id)
+                        if existing_order and has_incomplete_delivery(existing_order):
+                            logger.warning("订单发货或结算未完成，禁止重复耗卡: order_id={}", order_id)
+                            return
                         if existing_order and (
                             existing_order.get('status') == 'shipped'
                             or existing_order.get('card_only_delivered')
@@ -1295,8 +1326,6 @@ class AutoDeliveryHandler:
                     )
                     if send_ok:
                         try:
-                            from common.services.order_service import OrderService
-                            from common.db.session import async_session_maker
                             async with async_session_maker() as db_session:
                                 await OrderService(db_session).record_card_only_delivery(
                                     order_no=order_id,
@@ -1376,6 +1405,10 @@ class AutoDeliveryHandler:
                     quantity_degraded_for_fixed_content = False
                     # 账号开关可能在发货过程中变化；最终必须以平台接口是否已经成功为准落库。
                     platform_shipping_confirmed = bool(pre_check.get('platform_shipping_confirmed'))
+                    configuration_break = False
+                    configuration_break_reason = None
+                    agent_deliveries = []
+                    settlement_fail_reason = None
 
                     # 在循环开始前清空上次的卡券来源/类型记录，避免跨订单残留
                     self._last_delivery_card_source = None
@@ -1392,6 +1425,8 @@ class AutoDeliveryHandler:
                             )
                             if isinstance(delivery_result, dict):
                                 delivery_content = delivery_result.get('content')
+                                if delivery_content and delivery_result.get('agent_settlement_card'):
+                                    agent_deliveries.append((delivery_result['agent_settlement_card'], delivery_content))
                                 if delivery_result.get('form_only_delivered'):
                                     form_delivery_content = delivery_content
                                 platform_shipping_confirmed = (
@@ -1401,6 +1436,18 @@ class AutoDeliveryHandler:
                                 if delivery_result.get('skipped_only_send_card'):
                                     only_send_card_mode = True
                                     skip_shipping_confirm = True
+                                if delivery_result.get('delivery_configuration_changed'):
+                                    configuration_break = True
+                                    configuration_break_reason = (
+                                        delivery_result.get('early_break_reason')
+                                        or self._last_delivery_fail_reason
+                                        or "卡券授权配置已变更"
+                                    )
+                                    logger.warning(
+                                        f"【{self.cookie_id}】订单 {order_id} 卡券配置中断，"
+                                        f"已取 {success_count}/{quantity_to_send} 张，停止后续获取：{configuration_break_reason}"
+                                    )
+                                    break
                             else:
                                 delivery_content = delivery_result
                             if delivery_content:
@@ -1447,25 +1494,55 @@ class AutoDeliveryHandler:
                         except Exception as e:
                             logger.error(f"第 {i+1}/{quantity_to_send} 个卡券获取异常: {self._safe_str(e)}")
 
+                    if agent_deliveries:
+                        agent_content = form_delivery_content or "\n---\n".join(delivery_contents)
+                        async def record_agent_content():
+                            async with async_session_maker() as record_session:
+                                service = OrderService(record_session)
+                                pending_result = {"delivery_incomplete": False, "delivery_configuration_changed": False,
+                                                  "agent_settlement_failed": True, "quantity_requested": quantity_to_send,
+                                                  "quantity_sent": len(delivery_contents) or 1,
+                                                  "platform_shipping_confirmed": platform_shipping_confirmed,
+                                                  "message": "已取卡券，代理结算处理中，请勿重复发卡"}
+                                if platform_shipping_confirmed:
+                                    return await service.update_order_delivery_info(order_id, "shipped", "auto", agent_content, local_buyer_fish_nick, delivery_result=pending_result)
+                                return await service.record_card_only_delivery(order_id, "auto", agent_content, local_buyer_fish_nick, delivery_result=pending_result)
+                        settlement_fail_reason = await record_and_settle_agent_deliveries(
+                            self, order_no=order_id, item_id=item_id, buyer_id=send_user_id,
+                            owner_id=self.parent.user_id, content=agent_content,
+                            record_content=record_agent_content, deliveries=agent_deliveries,
+                        )
+
                     # 无需邮寄表单已经在确认发货接口提交成功，只落库，不再发送聊天消息。
                     if form_delivery_content:
                         self.mark_delivery_sent(order_id)
                         try:
-                            from common.services.order_service import OrderService
-                            from common.db.session import async_session_maker
                             async with async_session_maker() as db_session:
-                                await OrderService(db_session).update_order_delivery_info(
+                                form_saved = await OrderService(db_session).update_order_delivery_info(
                                     order_no=order_id,
                                     status="shipped",
                                     delivery_method="auto",
                                     delivery_content=form_delivery_content,
                                     buyer_fish_nick=local_buyer_fish_nick,
+                                    **({"delivery_result": {"delivery_incomplete": False, "delivery_configuration_changed": False,
+                                                            "agent_settlement_failed": bool(settlement_fail_reason),
+                                                            "message": settlement_fail_reason or "无需邮寄表单及代理结算已完成"}}
+                                       if agent_deliveries else {}),
                                 )
+                                if agent_deliveries and not form_saved:
+                                    raise RuntimeError("表单发货及代理结算结果未能保存，待核实标记保持不变")
                             logger.info(
                                 f"【{self.cookie_id}】订单 {order_id} 已通过无需邮寄表单发货，未发送聊天消息"
                             )
                         except Exception as e:
                             logger.error(f"【{self.cookie_id}】更新表单发货订单状态失败: {self._safe_str(e)}")
+                            if agent_deliveries:
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id,
+                                    f"表单已提交，但发货及结算结果保存失败：{e}；请人工核实，勿重复发卡或扣款", chat_id, order_id=order_id)
+                        if settlement_fail_reason:
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id,
+                                                                          settlement_fail_reason, chat_id, order_id=order_id)
+                            await self._update_delivery_fail_reason(order_id, settlement_fail_reason)
                     # 如果订单已发货，不需要发送通知
                     elif order_already_shipped:
                         logger.info(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 已发货，无需重复处理')
@@ -1653,6 +1730,11 @@ class AutoDeliveryHandler:
                             send_results=send_results,
                             any_send_failed=any_send_failed,
                             defer_send_status_writeback=wait_card_receipt,
+                            **({"settlement_fail_reason": settlement_fail_reason} if settlement_fail_reason else {}),
+                            **({"configuration_stop_reason": (
+                                f"仅取出 {len(delivery_contents)}/{quantity_to_send} 张卡券，后续发货已停止："
+                                f"{configuration_break_reason}；请人工核实后补发"
+                            )} if configuration_break else {}),
                         )
 
                         # "卡券发送成功再确认发货"模式：卡券已发送，现在执行确认发货
@@ -1665,7 +1747,13 @@ class AutoDeliveryHandler:
                                 send_results, delivery_log_ctx, msg_time, order_id
                             )
 
-                        if send_before_confirm_active and not any_send_failed and not card_intercept_reason:
+                        if configuration_break:
+                            logger.warning(
+                                f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 发货已因配置变更中断，跳过后置确认发货'
+                            )
+                        elif settlement_fail_reason:
+                            logger.error("已耗卡结算失败，跳过后置确认: order_id={}, reason={}", order_id, settlement_fail_reason)
+                        elif send_before_confirm_active and not any_send_failed and not card_intercept_reason:
                             logger.info(f'[{msg_time}] 【{self.cookie_id}】卡券发送成功，开始执行确认发货: order_id={order_id}')
                             if self.is_auto_confirm_enabled():
                                 confirm_result = await self.auto_confirm(order_id, item_id)
@@ -1724,6 +1812,54 @@ class AutoDeliveryHandler:
                         # 或确认接口已经实际成功。这里必须以最终平台调用结果重新计算，
                         # 否则会把“只发卡券”订单错误更新为 shipped。
                         only_send_card_result = only_send_card_mode and not platform_shipping_confirmed
+                        delivery_incomplete = (configuration_break or bool(settlement_fail_reason)) and not platform_shipping_confirmed
+                        configuration_stop_msg = None
+                        result_values = {}
+                        if configuration_break:
+                            platform_notice = (
+                                "订单已关闭" if closed_order_card_only
+                                else "平台已确认发货" if platform_shipping_confirmed
+                                else "平台尚未确认发货"
+                            )
+                            configuration_stop_msg = (
+                                f"已取出 {len(delivery_contents)}/{quantity_to_send} 张卡券，后续发货已停止，"
+                                f"{platform_notice}，请人工核实后补发：{configuration_break_reason}"
+                            )
+                            if any_send_failed:
+                                configuration_stop_msg += "；部分卡券消息发送失败，请核实已取内容并手动补发"
+                            if card_intercept_reason:
+                                configuration_stop_msg += f"；卡券疑似被平台拦截（{card_intercept_reason}），请核实买家是否收到"
+                            result_values["delivery_result"] = {
+                                "order_no": order_id,
+                                "delivery_method": "auto",
+                                "delivery_type": self._last_delivery_card_type,
+                                "delivery_incomplete": delivery_incomplete,
+                                "delivery_configuration_changed": True,
+                                "quantity_requested": quantity_to_send,
+                                "quantity_sent": len(delivery_contents),
+                                "only_send_card": only_send_card_result,
+                                "is_card_only": closed_order_card_only,
+                                "platform_shipping_confirmed": platform_shipping_confirmed,
+                                "early_break_reason": configuration_break_reason,
+                                "send_failed": any_send_failed,
+                                "send_intercepted": bool(card_intercept_reason),
+                                "send_intercept_reason": card_intercept_reason,
+                                "message": configuration_stop_msg,
+                            }
+                        if settlement_fail_reason:
+                            result_values.setdefault("delivery_result", {
+                                "delivery_incomplete": delivery_incomplete,
+                                "delivery_configuration_changed": configuration_break,
+                                "quantity_requested": quantity_to_send,
+                                "quantity_sent": len(delivery_contents),
+                                "platform_shipping_confirmed": platform_shipping_confirmed,
+                            }).update(agent_settlement_failed=True, message=settlement_fail_reason)
+                        elif agent_deliveries:
+                            result_values.setdefault("delivery_result", {
+                                "delivery_incomplete": delivery_incomplete,
+                                "delivery_configuration_changed": configuration_break,
+                                "message": "发货及代理结算已完成",
+                            })["agent_settlement_failed"] = False
                         card_only_send_fail_msg = None
                         if only_send_card_result:
                             if card_intercept_reason:
@@ -1736,7 +1872,7 @@ class AutoDeliveryHandler:
                                     "部分卡券消息发送失败，已记录卡券内容；"
                                     "请检查买家是否收到并手动补发失败内容"
                                 )
-                            if card_only_send_fail_msg:
+                            if card_only_send_fail_msg and not configuration_break:
                                 await self.send_delivery_failure_notification(
                                     send_user_name, send_user_id, item_id,
                                     card_only_send_fail_msg,
@@ -1755,7 +1891,14 @@ class AutoDeliveryHandler:
 
                         # 发送成功通知（仅 IM 通知，fail_reason 写库延后到 update_order_delivery_info 之后，
                         # 否则会被 update_order_delivery_info 内部的 delivery_fail_reason=None 清空）
-                        if quantity_degraded_for_dock:
+                        if settlement_fail_reason:
+                            logger.error("代理结算未完成: order_id={}, reason={}", order_id, settlement_fail_reason)
+                        elif configuration_break:
+                            # 中断结果通知在实际保存后发送，不能提前报告普通发货成功。
+                            logger.warning(f"【{self.cookie_id}】订单 {order_id} {configuration_stop_msg}")
+                        elif agent_deliveries:
+                            logger.info("代理结算已完成，等待最终发货结果保存后通知: order_id={}", order_id)
+                        elif quantity_degraded_for_dock:
                             # 对接卡券退化场景：商家必须明确知道还要手动补发剩余卡密
                             remaining = max(quantity_to_send - len(delivery_contents), 0)
                             await self.send_delivery_failure_notification(
@@ -1806,45 +1949,59 @@ class AutoDeliveryHandler:
                         
                         # 更新订单状态和发货信息（不受消息发送结果影响）
                         # card_only 场景：订单已被关闭，仅记录补发卡券内容，不动 status / fail_reason
+                        delivery_record_saved = False
+                        combined_content = "\n---\n".join(delivery_contents) if len(delivery_contents) > 1 else delivery_contents[0]
                         try:
-                            from common.services.order_service import OrderService
-                            from common.db.session import async_session_maker
                             async with async_session_maker() as db_session:
                                 order_service = OrderService(db_session)
-                                # 合并所有发货内容
-                                combined_content = "\n---\n".join(delivery_contents) if len(delivery_contents) > 1 else delivery_contents[0]
                                 if closed_order_card_only:
                                     # card_only：仅记录 delivery_method/content，保留 status='closed' 和 fail_reason
-                                    await order_service.record_delivery_for_closed_order(
+                                    delivery_record_saved = await order_service.record_delivery_for_closed_order(
                                         order_no=order_id,
                                         delivery_method="auto",
                                         delivery_content=combined_content,
                                         buyer_fish_nick=local_buyer_fish_nick,
+                                        **result_values,
                                     )
-                                    logger.info(
+                                    delivery_record_notice = (
                                         f"【{self.cookie_id}】订单 {order_id} card_only 模式：已记录补发卡券内容（订单状态保持已关闭）"
                                     )
-                                elif only_send_card_result:
-                                    await order_service.record_card_only_delivery(
+                                elif only_send_card_result or delivery_incomplete:
+                                    delivery_record_saved = await order_service.record_card_only_delivery(
                                         order_no=order_id,
                                         delivery_method="auto",
                                         delivery_content=combined_content,
                                         buyer_fish_nick=local_buyer_fish_nick,
+                                        **result_values,
                                     )
-                                    logger.info(
-                                        f"【{self.cookie_id}】订单 {order_id} 只发卡券完成，"
+                                    delivery_record_notice = (
+                                        f"【{self.cookie_id}】订单 {order_id} 已取卡券内容已记录，"
                                         f"已写入防重复标记，平台订单状态保持不变"
                                     )
                                 else:
                                     # 正常发货：记录发货方式为"自动发货"
-                                    await order_service.update_order_delivery_info(
+                                    delivery_record_saved = await order_service.update_order_delivery_info(
                                         order_no=order_id,
                                         status="shipped",
                                         delivery_method="auto",
                                         delivery_content=combined_content,
                                         buyer_fish_nick=local_buyer_fish_nick,
+                                        **result_values,
                                     )
-                                    logger.info(f"【{self.cookie_id}】订单 {order_id} 状态已更新为已发货（自动发货）")
+                                    delivery_record_notice = f"【{self.cookie_id}】订单 {order_id} 状态已更新为已发货（自动发货）"
+                                if (configuration_break or settlement_fail_reason or agent_deliveries) and not delivery_record_saved:
+                                    raise RuntimeError("发货状态、已取内容与中断结果未能保存")
+                                logger.info(delivery_record_notice)
+                                if configuration_break:
+                                    failure_reason_saved = await order_service.update_order_delivery_fail_reason(
+                                        order_id, configuration_stop_msg,
+                                    )
+                                    if not failure_reason_saved:
+                                        raise RuntimeError("发货结果已保存，但失败原因字段未能保存")
+                                    logger.warning(f"【{self.cookie_id}】订单 {order_id} 配置中断结果已保存：{configuration_stop_msg}")
+                                if settlement_fail_reason:
+                                    if not await order_service.update_order_delivery_fail_reason(order_id, settlement_fail_reason):
+                                        raise RuntimeError("代理结算失败原因未能保存")
 
                                 # 退化提示写入：必须在 update_order_delivery_info 之后，否则会被其内部
                                 # delivery_fail_reason=None 清空。card_only 走 record_delivery_for_closed_order
@@ -1880,7 +2037,7 @@ class AutoDeliveryHandler:
                                 # 记录确认发货或只发卡券流程中的异常原因
                                 # 必须在 update_order_delivery_info 之后，否则会被其内部 delivery_fail_reason=None 清空
                                 delivery_fail_msg = card_only_send_fail_msg or send_before_confirm_fail_msg
-                                if delivery_fail_msg and not degraded_warn_msg:
+                                if not configuration_break and delivery_fail_msg and not degraded_warn_msg:
                                     try:
                                         await order_service.update_order_delivery_fail_reason(
                                             order_id, delivery_fail_msg
@@ -1892,7 +2049,7 @@ class AutoDeliveryHandler:
                                         logger.warning(
                                             f"【{self.cookie_id}】订单 {order_id} 写入发货异常原因失败: {self._safe_str(_sbc_err)}"
                                         )
-                                elif delivery_fail_msg and degraded_warn_msg:
+                                elif not configuration_break and delivery_fail_msg and degraded_warn_msg:
                                     # 两者都有时合并写入
                                     combined_reason = f"{degraded_warn_msg}；{delivery_fail_msg}"
                                     try:
@@ -1907,7 +2064,43 @@ class AutoDeliveryHandler:
                                             f"【{self.cookie_id}】订单 {order_id} 写入合并失败原因失败: {self._safe_str(_sbc_err)}"
                                         )
                         except Exception as e:
-                            logger.error(f"【{self.cookie_id}】更新订单状态失败: {self._safe_str(e)}")
+                            logger.exception(f"【{self.cookie_id}】更新订单状态失败: order_id={order_id}, {e}")
+                            if agent_deliveries and not settlement_fail_reason:
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id,
+                                    f"卡券已取出且已尝试结算，但最终发货结果保存失败：{e}；请人工核实，勿重复发卡或扣款", chat_id, order_id=order_id)
+                            if settlement_fail_reason:
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id,
+                                    f"{settlement_fail_reason}；发货结果保存失败：{e}；请立即人工核实，勿重复发卡", chat_id, order_id=order_id)
+                            if configuration_break:
+                                saved_notice = "发货结果已保存，但失败原因记录失败" if delivery_record_saved else "发货结果保存失败"
+                                logger.error(
+                                    f"【{self.cookie_id}】配置中断落库异常: order_id={order_id}, error={e}, "
+                                    f"delivery_result={result_values}, delivery_record_saved={delivery_record_saved}, "
+                                    f"delivery_content={combined_content}"
+                                )
+                                await self.send_delivery_failure_notification(
+                                    send_user_name, send_user_id, item_id,
+                                    f"{saved_notice}：{e}；{configuration_stop_msg}；"
+                                    "请立即人工核实本次已取卡券内容、订单和库存，勿直接重试以免重复耗卡",
+                                    chat_id, order_id=order_id,
+                                )
+                        else:
+                            if agent_deliveries and not settlement_fail_reason and not configuration_break:
+                                result_message = ("卡券发送成功（平台订单保持待发货）" if only_send_card_result
+                                                  else "发货成功")
+                                if quantity_degraded_for_dock:
+                                    result_message = f"已发送 1 张对接卡券，订单数量 {quantity_to_send} 张，剩余卡密请手动补发"
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id,
+                                                                              result_message, chat_id, order_id=order_id)
+                            if settlement_fail_reason:
+                                await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id,
+                                                                              settlement_fail_reason, chat_id, order_id=order_id)
+                            if configuration_break:
+                                await self.send_delivery_failure_notification(
+                                    send_user_name, send_user_id, item_id,
+                                    f"{configuration_stop_msg}；已取卡券内容已保存到订单，请核实后补发",
+                                    chat_id, order_id=order_id,
+                                )
                     else:
                         fail_msg = self._last_delivery_fail_reason or "未找到匹配的发货规则或获取发货内容失败"
                         logger.warning(f'[{msg_time}] 【自动发货】{fail_msg}')
@@ -2241,12 +2434,29 @@ class AutoDeliveryHandler:
 
             # 根据商品ID获取卡券（含来源信息：own/dock_l1/dock_l2）
             logger.info(f"根据商品ID获取卡券: {item_id}")
-            cards = db_manager.get_cards_by_item_id(item_id, spec_name, spec_value)
+            try:
+                cards = db_manager.get_cards_by_item_id(
+                    item_id, spec_name, spec_value, user_id=self.parent.user_id
+                )
+            except Exception as error:
+                self._last_delivery_fail_reason = f"查询当前卡券授权失败：{error}"
+                logger.exception(f"【{self.cookie_id}】订单 {order_id} {self._last_delivery_fail_reason}")
+                return {
+                    "content": None,
+                    "delivery_configuration_changed": True,
+                    "early_break_reason": self._last_delivery_fail_reason,
+                    "platform_shipping_confirmed": platform_shipping_confirmed,
+                }
             
             if not cards:
                 self._last_delivery_fail_reason = f"商品 {item_id} 未配置卡券，无法自动发货"
                 logger.warning(f"❌ 商品 {item_id} 未配置卡券，无法自动发货")
-                return None
+                return {
+                    "content": None,
+                    "delivery_configuration_changed": True,
+                    "early_break_reason": self._last_delivery_fail_reason,
+                    "platform_shipping_confirmed": platform_shipping_confirmed,
+                }
             
             # 按优先级分组：自有 → 一级对接 → 二级对接
             source_priority = ['own', 'dock_l1', 'dock_l2']
@@ -2271,10 +2481,16 @@ class AutoDeliveryHandler:
             if not card:
                 self._last_delivery_fail_reason = f"商品 {item_id} 未在任何来源中唯一匹配到卡券，跳过自动发货（共 {len(cards)} 条关联）"
                 logger.warning(f"⚠️ 商品 {item_id} 未在任何来源中唯一匹配到卡券，跳过自动发货（共 {len(cards)} 条关联）")
-                return None
+                return {
+                    "content": None,
+                    "delivery_configuration_changed": True,
+                    "early_break_reason": self._last_delivery_fail_reason,
+                    "platform_shipping_confirmed": platform_shipping_confirmed,
+                }
             
             # 对接卡券发货前校验：最低售价 + 金额覆盖手续费和成本
             card_source = card.get('card_source', 'own')
+            dock_record_id = card.get('dock_record_id')
 
             # 记录本次匹配到的卡券来源/类型，供外层多数量循环判断是否退化为单张：
             # 1) 对接卡券循环 N 次会触发底层结算逻辑的金额 bug（手续费按张重复扣等）
@@ -2339,6 +2555,37 @@ class AutoDeliveryHandler:
                 logger.info(f"检测到发货延时设置: {delay_seconds}秒，开始延时...")
                 await asyncio.sleep(delay_seconds)
                 logger.info(f"延时完成")
+
+                # 延时期间可能解绑、删除或停用，平台确认前重新检查实际用户的授权。
+                try:
+                    current_cards = db_manager.get_cards_by_item_id(
+                        item_id, spec_name, spec_value, user_id=self.parent.user_id
+                    )
+                except Exception as error:
+                    self._last_delivery_fail_reason = f"发货延时后重新校验卡券授权失败：{error}"
+                    logger.exception(
+                        f"【{self.cookie_id}】订单 {order_id} {self._last_delivery_fail_reason}"
+                    )
+                    return {
+                        "content": None,
+                        "delivery_configuration_changed": True,
+                        "early_break_reason": self._last_delivery_fail_reason,
+                        "platform_shipping_confirmed": platform_shipping_confirmed,
+                    }
+                if not any(
+                    current.get('id') == card.get('id')
+                    and current.get('card_source', 'own') == card_source
+                    and (current.get('dock_record_id') or 0) == (dock_record_id or 0)
+                    for current in current_cards
+                ):
+                    self._last_delivery_fail_reason = "发货延时期间卡券已删除、停用或解绑，请重新检查配置"
+                    logger.warning(self._last_delivery_fail_reason)
+                    return {
+                        "content": None,
+                        "delivery_configuration_changed": True,
+                        "early_break_reason": self._last_delivery_fail_reason,
+                        "platform_shipping_confirmed": platform_shipping_confirmed,
+                    }
 
             use_no_logistics_form = rule.get('use_no_logistics_form', False)
             form_trade_text = str(rule.get('card_text_content') or '').strip()
@@ -2528,7 +2775,14 @@ class AutoDeliveryHandler:
 
                 elif rule['card_type'] == 'data':
                     # 批量数据类型：获取并消费第一条数据
-                    text_content = db_manager.consume_batch_data(rule['card_id'])
+                    try:
+                        text_content = db_manager.consume_batch_data(rule['card_id'])
+                    except Exception as error:
+                        self._last_delivery_fail_reason = str(error) if isinstance(error, CardConsumptionConfigurationError) else f"消费卡券失败，已停止后续发货：{error}"
+                        logger.opt(exception=error).error("消费卡券中断: order_id={}, card_id={}", order_id, rule['card_id'])
+                        return {"content": None, "delivery_configuration_changed": True,
+                                "early_break_reason": self._last_delivery_fail_reason,
+                                "platform_shipping_confirmed": platform_shipping_confirmed}
                     if text_content is None:
                         self._last_delivery_fail_reason = f"批量卡券数据已用完或获取失败: 卡券ID={rule['card_id']}, 名称={rule['card_name']}"
                         logger.warning(self._last_delivery_fail_reason)
@@ -2624,23 +2878,12 @@ class AutoDeliveryHandler:
                     
                     # 如果是对接卡券，创建代理订单记录
                     card_source = card.get('card_source', 'own')
-                    if card_source in ('dock_l1', 'dock_l2'):
-                        try:
-                            await self._create_agent_order(
-                                order_id=order_id,
-                                item_id=item_id,
-                                card=card,
-                                delivery_content=delivery_content,
-                                buyer_id=send_user_id,
-                            )
-                        except Exception as agent_err:
-                            logger.error(f"创建代理订单失败（不影响发货）: {self._safe_str(agent_err)}")
-                    
                     return {
                         'content': delivery_content,
                         'platform_shipping_confirmed': platform_shipping_confirmed,
                         'skipped_only_send_card': skipped_only_send_card,
                         'form_only_delivered': use_no_logistics_form,
+                        'agent_settlement_card': card if card_source in ('dock_l1', 'dock_l2') else None,
                     }
                 else:
                     self._last_delivery_fail_reason = f"获取发货内容失败: 卡券ID={rule['card_id']}, 卡券名称={rule.get('card_name')}, 类型={rule.get('card_type')}"
@@ -2675,14 +2918,6 @@ class AutoDeliveryHandler:
         Returns:
             True=允许发货, False=不允许
         """
-        from common.db.session import async_session_maker
-        from common.models.dock_record import DockRecord
-        from common.models.card import Card as CardModel
-        from common.models.system_setting import SystemSetting
-        from common.services.settlement_service import SettlementService
-        from decimal import Decimal, InvalidOperation
-        from sqlalchemy import select
-        
         card_source = card.get('card_source', 'own')
         dock_record_id = card.get('dock_record_id')
         
@@ -2692,6 +2927,10 @@ class AutoDeliveryHandler:
         
         try:
             async with async_session_maker() as session:
+                await CardAccess(session).validate_bindings(self.parent.user_id, [{
+                    'card_id': card.get('id'), 'source': card_source,
+                    'dock_record_id': dock_record_id,
+                }])
                 # 获取订单售价
                 sale_price_str = '0.00'
                 try:
@@ -2706,7 +2945,7 @@ class AutoDeliveryHandler:
                 logger.info(f"📋 校验-订单售价: order_id={order_id}, sale_price_str='{sale_price_str}', sale_price={sale_price}")
                 
                 # 获取卡券信息
-                card_stmt = select(CardModel).where(CardModel.id == card.get('id'))
+                card_stmt = select(CardModel).where(CardModel.id == card.get('id'), CardModel.is_deleted == False, CardModel.enabled == True)
                 card_result = await session.execute(card_stmt)
                 card_obj = card_result.scalars().first()
                 
@@ -2742,7 +2981,7 @@ class AutoDeliveryHandler:
                     fee_amount = fee_rate
                 
                 # 获取对接记录
-                dock_stmt = select(DockRecord).where(DockRecord.id == dock_record_id)
+                dock_stmt = select(DockRecord).where(DockRecord.id == dock_record_id, DockRecord.user_id == self.parent.user_id)
                 dock_result = await session.execute(dock_stmt)
                 dock_record = dock_result.scalars().first()
                 
@@ -2899,15 +3138,6 @@ class AutoDeliveryHandler:
             delivery_content: 发货内容
             buyer_id: 买家ID
         """
-        from common.db.session import async_session_maker
-        from common.models.agent_order import AgentOrder
-        from common.models.dock_record import DockRecord
-        from common.models.card import Card as CardModel
-        from common.models.system_setting import SystemSetting
-        from common.services.settlement_service import SettlementService
-        from decimal import Decimal, InvalidOperation
-        from sqlalchemy import select
-        
         card_source = card.get('card_source', 'own')
         dock_record_id = card.get('dock_record_id')
         
@@ -2917,20 +3147,22 @@ class AutoDeliveryHandler:
         
         async with async_session_maker() as session:
             # 获取对接记录详情
-            stmt = select(DockRecord).where(DockRecord.id == dock_record_id)
+            stmt = select(DockRecord).where(DockRecord.id == dock_record_id, DockRecord.user_id == self.parent.user_id)
             result = await session.execute(stmt)
             dock_record = result.scalars().first()
             
             if not dock_record:
-                logger.warning(f"未找到对接记录 {dock_record_id}，跳过代理订单创建")
-                return
+                raise ValueError(f"已取卡券的对接记录 {dock_record_id} 不存在或归属不一致，无法结算")
             
             dock_level = dock_record.level  # 1 or 2
             
             # 获取卡券信息（成本价、手续费支付方）
+            # 已授权并取出的卡券仍需结算；软删除只阻止后续取卡，不免除本次实际成本。
             card_stmt = select(CardModel).where(CardModel.id == card.get('id'))
             card_result = await session.execute(card_stmt)
             card_obj = card_result.scalars().first()
+            if not card_obj:
+                raise ValueError("已取卡券的保留记录不存在，无法结算，请人工核实本次发货")
             
             card_price = card_obj.price or '0.00' if card_obj else '0.00'  # 货主的对接价（卡券成本）
             fee_payer = card_obj.fee_payer if card_obj else None  # dealer/distributor
@@ -3045,11 +3277,14 @@ class AutoDeliveryHandler:
             
             # 执行分润结算（在同一个 session/事务中）
             settlement = SettlementService(session)
-            
+            settlement_error = None
+            settlement_savepoint = None
             try:
+                # 代理记录保留在外层事务；任何资金操作失败只回滚本次资金操作。
+                settlement_savepoint = await session.begin_nested()
                 if dock_level == 1 and owner_user_id:
                     # 一级结算
-                    await settlement.settle_level1_order(
+                    settlement_result = await settlement.settle_level1_order(
                         order_no=order_id,
                         dealer_user_id=user_id,
                         owner_user_id=owner_user_id,
@@ -3060,11 +3295,10 @@ class AutoDeliveryHandler:
                         fee_payer=fee_payer,
                         fee_amount=fee_amount,
                     )
-                    agent_order.status = 'settled'
                     
                 elif dock_level == 2 and level1_user_id and owner_user_id:
                     # 二级结算
-                    await settlement.settle_level2_order(
+                    settlement_result = await settlement.settle_level2_order(
                         order_no=order_id,
                         dealer_user_id=user_id,
                         level1_user_id=level1_user_id,
@@ -3078,13 +3312,35 @@ class AutoDeliveryHandler:
                         fee_payer=fee_payer,
                         fee_amount=fee_amount,
                     )
-                    agent_order.status = 'settled'
-                    
+                else:
+                    raise ValueError("代理结算缺少有效层级或收款用户信息")
+                if not isinstance(settlement_result, dict) or settlement_result.get('success') is not True:
+                    raise RuntimeError((settlement_result or {}).get('message') or "分润结算未返回成功结果")
+                await settlement_savepoint.commit()
+                agent_order.status = 'settled'
             except Exception as settle_err:
-                logger.error(f"分润结算失败（不影响代理订单记录）: {self._safe_str(settle_err)}")
-                agent_order.settle_remark = f'结算失败: {self._safe_str(settle_err)}'
+                if settlement_savepoint is not None and settlement_savepoint.is_active:
+                    try:
+                        await settlement_savepoint.rollback()
+                    except Exception as rollback_error:
+                        raise AgentSettlementCommitUncertainError(
+                            f"订单 {order_id} 结算失败：{settle_err}；资金操作回滚失败：{rollback_error}"
+                        ) from rollback_error
+                if not session.is_active:
+                    raise AgentSettlementCommitUncertainError(
+                        f"订单 {order_id} 结算失败且数据库事务已失效：{settle_err}，请人工核实资金流水"
+                    ) from settle_err
+                settlement_error = self._safe_str(settle_err)
+                logger.opt(exception=settle_err).error("分润结算失败，已回滚资金操作，保留待核实代理订单: order_id={}", order_id)
+                agent_order.status = 'failed'
+                agent_order.settle_remark = f'结算失败: {settlement_error}'[:500]
             
-            await session.commit()
+            try:
+                await session.commit()
+            except Exception as error:
+                raise AgentSettlementCommitUncertainError(f"订单 {order_id} 的代理结算提交失败：{error}") from error
+            return {"success": settlement_error is None, "agent_order_id": agent_order.id,
+                    "message": f"分润结算失败：{settlement_error}" if settlement_error else "代理结算成功"}
 
     # ==================== API卡券获取 ====================
 
@@ -3460,210 +3716,6 @@ class AutoDeliveryHandler:
             return -1
 
     # ==================== 禁止发货统一拦截入口 ====================
-
-    async def pre_delivery_check_and_close(
-        self,
-        websocket,
-        order_no: str,
-        buyer_id: str,
-        chat_id: str | None = None,
-        log_prefix: str = '',
-        item_id: str | None = None,
-    ) -> dict:
-        """禁止发货预检查 + 主动关闭订单（统一收口入口）
-
-        所有发货入口（手动发货 / 定时补发货 / 消息触发自动发货 / 卡片更新 / 小刀
-        卡片 / 重发货关键字）调用此方法即可获得一致的拦截行为。
-
-        流程（规则引擎化）：
-          1. 从 xy_delivery_block_rules 表加载该账号所有已启用规则（按 priority 排序）
-          2. 无已启用规则 → 直接放行 action='allow'
-          3. 逐条执行规则检查：
-             - 每条规则先检查自己的排除商品列表，命中则跳过本规则
-             - 规则检查通过 → 继续下一条
-             - 规则命中 → 执行拦截动作（发消息/写fail_reason/关单）
-          4. 首条命中即停，用该规则自己的配置决定后续动作
-          5. 全部通过 → 放行 action='allow'
-
-        Args:
-            websocket: 用于向买家发送禁止发货提示消息的 WebSocket 连接
-            order_no: 订单号
-            buyer_id: 买家用户ID
-            chat_id: 聊天会话ID（缺失时不发消息但仍拦截 + 关闭订单）
-            log_prefix: 日志前缀
-            item_id: 当前订单对应的商品ID
-
-        Returns:
-            {
-                'action': 'allow' | 'block' | 'card_only',
-                'blocked': bool,             # 仅在 action=='block' 时为 True
-                'reason_text': str,          # 配置的禁止发货原因
-                'fail_record': str,          # 写入 delivery_fail_reason 的文案
-                'auto_close_enabled': bool,  # 是否开启了主动关闭订单
-                'order_closed': bool,        # 关闭订单是否成功
-                'only_card_enabled': bool,   # 是否开启"关闭订单后继续发货"
-                'total_count': int,          # 兼容字段（-1 表示未使用旧逻辑）
-                'rule_code': str | None,     # 命中的规则编码
-                'rule_name': str | None,     # 命中的规则名称
-            }
-        """
-        pf = log_prefix or f'【{self.cookie_id}】'
-
-        # 获取买家闲鱼昵称（明文），存到实例属性供后续写入订单
-        self._current_buyer_fish_nick = None
-        if chat_id:
-            try:
-                from common.utils.fish_nick_utils import get_buyer_fish_nick
-                from common.utils.cookie_refresh import get_account_by_identity
-                from common.db.session import async_session_maker
-
-                latest_cookies = self.cookies_str
-                try:
-                    async with async_session_maker() as db_session:
-                        account = await get_account_by_identity(self.cookie_id, session=db_session)
-                        if account and account.cookie:
-                            latest_cookies = account.cookie
-                            if latest_cookies != self.cookies_str:
-                                self.cookies_str = latest_cookies
-                                from common.utils.xianyu_utils import trans_cookies
-                                self.cookies = trans_cookies(latest_cookies)
-                except Exception as db_e:
-                    logger.warning(f'{pf}从数据库获取最新Cookie失败，使用内存Cookie: {db_e}')
-
-                self._current_buyer_fish_nick = await get_buyer_fish_nick(
-                    latest_cookies, chat_id, self.cookie_id
-                )
-            except Exception as nick_e:
-                logger.warning(f'{pf}获取买家闲鱼昵称失败（不影响发货流程）: {nick_e}')
-
-        # 查询账号所属用户ID与主键（供按用户维度判断的规则使用，如"买家在同用户其他账号已有订单"）
-        account_owner_id = None
-        account_pk = None
-        try:
-            from common.utils.cookie_refresh import get_account_by_identity
-            from common.db.session import async_session_maker
-
-            async with async_session_maker() as owner_session:
-                _acc = await get_account_by_identity(self.cookie_id, session=owner_session)
-                if _acc:
-                    account_owner_id = _acc.owner_id
-                    account_pk = _acc.id
-        except Exception as owner_e:
-            logger.warning(f'{pf}查询账号owner_id失败（不影响按账号维度的规则）: {self._safe_str(owner_e)}')
-
-        # 调用规则引擎执行检查
-        try:
-            from app.services.xianyu.delivery_rules.rule_engine import execute_rules
-
-            engine_result = await execute_rules(
-                cookie_id=self.cookie_id,
-                cookies_str=self.cookies_str,
-                order_no=order_no,
-                buyer_id=buyer_id,
-                item_id=item_id,
-                chat_id=chat_id,
-                log_prefix=pf,
-                account_pk=account_pk,
-                owner_id=account_owner_id,
-            )
-        except Exception as e:
-            logger.error(f'{pf}规则引擎执行异常: {self._safe_str(e)}，放行')
-            return {
-                'action': 'allow',
-                'blocked': False,
-                'reason_text': '',
-                'fail_record': '',
-                'auto_close_enabled': False,
-                'order_closed': False,
-                'only_card_enabled': False,
-                'total_count': -1,
-                'rule_code': None,
-                'rule_name': None,
-                'buyer_fish_nick': self._current_buyer_fish_nick,
-            }
-
-        # 未命中任何规则 → 放行
-        if not engine_result.get('hit'):
-            return {
-                'action': 'allow',
-                'blocked': False,
-                'reason_text': '',
-                'fail_record': '',
-                'auto_close_enabled': False,
-                'order_closed': False,
-                'only_card_enabled': False,
-                'total_count': -1,
-                'rule_code': None,
-                'rule_name': None,
-                'buyer_fish_nick': self._current_buyer_fish_nick,
-            }
-
-        # 命中规则 → 执行拦截动作
-        rule_code = engine_result.get('rule_code', '')
-        rule_name = engine_result.get('rule_name', '')
-        block_reason = engine_result.get('block_reason', '')
-        auto_close_enabled = engine_result.get('auto_close_order', False)
-        only_card_enabled = engine_result.get('only_card_after_close', False)
-        hit_reason = engine_result.get('reason', '')
-
-        # 1. 发送禁止发货提示消息给买家
-        if block_reason and chat_id:
-            try:
-                await self._send_msg_with_retry(websocket, chat_id, buyer_id, block_reason)
-            except Exception as send_err:
-                logger.error(f'{pf}发送禁止发货提示消息异常: {self._safe_str(send_err)}')
-        elif not block_reason:
-            logger.info(f'{pf}规则 [{rule_name}] 未配置禁止发货原因，跳过发送消息: order_no={order_no}')
-        elif not chat_id:
-            logger.warning(f'{pf}缺少 chat_id，无法发送禁止发货提示: order_no={order_no}')
-
-        # 2. 写订单 delivery_fail_reason
-        fail_record = block_reason if block_reason else hit_reason
-        try:
-            await self._update_delivery_fail_reason(order_no, fail_record)
-        except Exception as record_err:
-            logger.warning(f'{pf}记录禁止发货原因到订单表失败: {self._safe_str(record_err)}')
-
-        # 3. 按开关关闭订单
-        order_closed = False
-        if auto_close_enabled:
-            try:
-                order_closed = await self.close_order_by_seller(order_no)
-                if not order_closed:
-                    logger.warning(f'{pf}禁止发货后关闭订单失败：order_no={order_no}')
-            except Exception as close_err:
-                logger.error(f'{pf}禁止发货后关闭订单异常: {self._safe_str(close_err)}')
-        else:
-            logger.info(f'{pf}规则 [{rule_name}] 未开启"主动关闭订单"，跳过关闭: order_no={order_no}')
-
-        # 4. 决定最终动作
-        if auto_close_enabled and order_closed and only_card_enabled:
-            action = 'card_only'
-            logger.warning(
-                f'{pf}❌ 命中规则 [{rule_name}] + 关闭订单成功 + 只发卡券：'
-                f'order_no={order_no}, buyer_id={buyer_id}, reason={fail_record}'
-            )
-        else:
-            action = 'block'
-            logger.warning(
-                f'{pf}❌ 命中规则 [{rule_name}]：order_no={order_no}, buyer_id={buyer_id}, '
-                f'reason={fail_record}, auto_close={auto_close_enabled}, '
-                f'order_closed={order_closed}, only_card={only_card_enabled}'
-            )
-
-        return {
-            'action': action,
-            'blocked': action == 'block',
-            'reason_text': block_reason,
-            'fail_record': fail_record,
-            'auto_close_enabled': auto_close_enabled,
-            'order_closed': order_closed,
-            'only_card_enabled': only_card_enabled,
-            'total_count': -1,
-            'rule_code': rule_code,
-            'rule_name': rule_name,
-            'buyer_fish_nick': self._current_buyer_fish_nick,
-        }
 
     # ==================== 卖家主动关闭订单 ====================
 

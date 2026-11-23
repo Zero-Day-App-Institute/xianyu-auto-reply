@@ -65,17 +65,48 @@ MYSQL_DATABASE=xianyu_data
 MYSQL_USER=xianyu
 MYSQL_PASSWORD=xianyu@2026
 
+# 数据库连接池配置（三个服务峰值合计 2640）
+# 远程 MySQL 的 max_connections 必须大于该合计值并预留管理连接，建议不低于 4000
+BACKEND_DB_POOL_SIZE=800
+BACKEND_DB_MAX_OVERFLOW=60
+WEBSOCKET_DB_POOL_SIZE=800
+WEBSOCKET_DB_MAX_OVERFLOW=150
+SCHEDULER_DB_POOL_SIZE=800
+SCHEDULER_DB_MAX_OVERFLOW=30
+DB_POOL_TIMEOUT=30
+DB_POOL_RECYCLE=1800
+DB_POOL_PRE_PING=true
+DB_POOL_USE_LIFO=true
+DB_CONNECT_TIMEOUT=10
+
 # ========== 远程 Redis 配置（必填，请改成你的远程 Redis 地址） ==========
 # 同样不要填 localhost / 127.0.0.1
 REDIS_HOST=your-remote-redis-host
 REDIS_PORT=6379
+# 有密码时填写实际密码；无密码时填写 REDIS_PASSWORD=（保留空值）
+# 删除 REDIS_PASSWORD 整个配置项才会使用默认密码 xianyu@2026
 REDIS_PASSWORD=xianyu@2026
 REDIS_DB=0
+REDIS_POOL_SIZE=800
+REDIS_SOCKET_TIMEOUT=5
+REDIS_SOCKET_CONNECT_TIMEOUT=3
+REDIS_SOCKET_KEEPALIVE=true
+REDIS_SOCKET_KEEPALIVE_IDLE=60
+REDIS_SOCKET_KEEPALIVE_INTERVAL=10
+REDIS_SOCKET_KEEPALIVE_COUNT=3
+REDIS_HEALTH_CHECK_INTERVAL=30
+REDIS_PROTOCOL=2
+REDIS_STARTUP_MAX_RETRIES=5
+REDIS_STARTUP_RETRY_BASE_DELAY=1
+REDIS_STARTUP_RETRY_CAP_DELAY=10
 
 # 说明：JWT 密钥由数据库统一托管（首次启动自动生成并持久化），无需在此配置
 
 # 端口配置
 FRONTEND_PORT=9000
+XIANYU_NETWORK_SUBNET=172.30.56.0/24
+FRONTEND_IPV4_ADDRESS=172.30.56.10
+TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128,${FRONTEND_IPV4_ADDRESS}/32
 BACKEND_WEB_PORT=8089
 WEBSOCKET_PORT=8090
 SCHEDULER_PORT=8091
@@ -84,16 +115,18 @@ SCHEDULER_PORT=8091
 IMAGE_REGISTRY=registry.cn-shanghai.aliyuncs.com/zhinian-software
 IMAGE_TAG=latest
 
-# 日志级别
+# 日志级别及在线安装时限（秒）
 LOG_LEVEL=INFO
-
+LOG_FILE_MAX_SIZE=70 MB
+ONLINE_INSTALL_CONNECT_TIMEOUT=60
+ONLINE_INSTALL_TIMEOUT=7200
+ONLINE_INSTALL_RETENTION_SECONDS=86400
+CARD_REQUEST_MAX_BYTES=52428800
 # SQL 日志开关：true=打印每条执行的完整 SQL（便于排查）；默认 false，高并发生产环境建议保持关闭
 SQL_ECHO=false
-
 # IM Token 缓存基础 TTL 随机区间（小时）；之后追加 1~5 小时秒级随机偏移
 TOKEN_CACHE_TTL_MIN_HOURS=5
 TOKEN_CACHE_TTL_MAX_HOURS=10
-
 # Token过期时间（分钟）
 ACCESS_TOKEN_EXPIRE_MINUTES=1440
 REFRESH_TOKEN_EXPIRE_MINUTES=10080
@@ -136,6 +169,14 @@ ENVEOF
     exit 0
 fi
 
+# 仅补齐缺失配置，保留已有值；可信地址引用实际前端 IP，不扩大为整个容器网段。
+for proxy_setting in 'XIANYU_NETWORK_SUBNET=172.30.56.0/24' 'FRONTEND_IPV4_ADDRESS=172.30.56.10' 'TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128,${FRONTEND_IPV4_ADDRESS}/32'; do
+    proxy_key=${proxy_setting%%=*}
+    if ! grep -qE "^[[:space:]]*(export[[:space:]]+)?${proxy_key}[[:space:]]*=" "$ENV_FILE"; then
+        printf '\n%s\n' "$proxy_setting" >> "$ENV_FILE"
+    fi
+done
+
 # ========== 生成 docker-compose.remote.yml（远程镜像 + 远程 MySQL/Redis） ==========
 echo "[信息] 生成 docker-compose.remote.yml..."
 cat > "$COMPOSE_FILE" << 'COMPOSEEOF'
@@ -158,12 +199,36 @@ services:
       - MYSQL_USER=${MYSQL_USER:-xianyu}
       - MYSQL_PASSWORD=${MYSQL_PASSWORD:-xianyu@2026}
       - MYSQL_DATABASE=${MYSQL_DATABASE:-xianyu_data}
+      - DB_POOL_SIZE=${BACKEND_DB_POOL_SIZE:-800}
+      - DB_MAX_OVERFLOW=${BACKEND_DB_MAX_OVERFLOW:-60}
+      - DB_POOL_TIMEOUT=${DB_POOL_TIMEOUT:-30}
+      - DB_POOL_RECYCLE=${DB_POOL_RECYCLE:-1800}
+      - DB_POOL_PRE_PING=${DB_POOL_PRE_PING:-true}
+      - DB_POOL_USE_LIFO=${DB_POOL_USE_LIFO:-true}
+      - DB_CONNECT_TIMEOUT=${DB_CONNECT_TIMEOUT:-10}
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-xianyu@2026}
+      - REDIS_PASSWORD=${REDIS_PASSWORD-xianyu@2026}
       - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_POOL_SIZE=${REDIS_POOL_SIZE:-800}
+      - REDIS_SOCKET_TIMEOUT=${REDIS_SOCKET_TIMEOUT:-5}
+      - REDIS_SOCKET_CONNECT_TIMEOUT=${REDIS_SOCKET_CONNECT_TIMEOUT:-3}
+      - REDIS_SOCKET_KEEPALIVE=${REDIS_SOCKET_KEEPALIVE:-true}
+      - REDIS_SOCKET_KEEPALIVE_IDLE=${REDIS_SOCKET_KEEPALIVE_IDLE:-60}
+      - REDIS_SOCKET_KEEPALIVE_INTERVAL=${REDIS_SOCKET_KEEPALIVE_INTERVAL:-10}
+      - REDIS_SOCKET_KEEPALIVE_COUNT=${REDIS_SOCKET_KEEPALIVE_COUNT:-3}
+      - REDIS_HEALTH_CHECK_INTERVAL=${REDIS_HEALTH_CHECK_INTERVAL:-30}
+      - REDIS_PROTOCOL=${REDIS_PROTOCOL:-2}
+      - REDIS_STARTUP_MAX_RETRIES=${REDIS_STARTUP_MAX_RETRIES:-5}
+      - REDIS_STARTUP_RETRY_BASE_DELAY=${REDIS_STARTUP_RETRY_BASE_DELAY:-1}
+      - REDIS_STARTUP_RETRY_CAP_DELAY=${REDIS_STARTUP_RETRY_CAP_DELAY:-10}
       - BACKEND_WEB_PORT=8089
+      - CARD_REQUEST_MAX_BYTES=${CARD_REQUEST_MAX_BYTES:-52428800}
+      - ONLINE_INSTALL_CONNECT_TIMEOUT=${ONLINE_INSTALL_CONNECT_TIMEOUT:-60}
+      - ONLINE_INSTALL_TIMEOUT=${ONLINE_INSTALL_TIMEOUT:-7200}
+      - ONLINE_INSTALL_RETENTION_SECONDS=${ONLINE_INSTALL_RETENTION_SECONDS:-86400}
       - HOST=0.0.0.0
+      - TRUSTED_PROXY_CIDRS=${TRUSTED_PROXY_CIDRS-127.0.0.1/32,::1/128,${FRONTEND_IPV4_ADDRESS:-172.30.56.10}/32}
       - JWT_ALGORITHM=HS256
       - ACCESS_TOKEN_EXPIRE_MINUTES=${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
       - REFRESH_TOKEN_EXPIRE_MINUTES=${REFRESH_TOKEN_EXPIRE_MINUTES:-10080}
@@ -171,6 +236,7 @@ services:
       - CORS_ORIGINS=*
       - WEBSOCKET_SERVICE_URL=http://websocket:8090
       - SCHEDULER_SERVICE_URL=http://scheduler:8091
+      - FRONTEND_SERVICE_URL=${FRONTEND_SERVICE_URL:-http://frontend:80}
       - STATIC_DIR=/app/static
       - BACKUP_DIR=/app/backups
       - BACKEND_WEB_PUBLIC_URL=${BACKEND_WEB_PUBLIC_URL:-}
@@ -184,6 +250,7 @@ services:
       - ENABLE_REMOTE_POPUP_ANNOUNCEMENTS=${ENABLE_REMOTE_POPUP_ANNOUNCEMENTS:-true}
       - BROWSER_HEADLESS=true
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FILE_MAX_SIZE=${LOG_FILE_MAX_SIZE:-70 MB}
       - SQL_ECHO=${SQL_ECHO:-false}
       - TOKEN_CACHE_TTL_MIN_HOURS=${TOKEN_CACHE_TTL_MIN_HOURS:-5}
       - TOKEN_CACHE_TTL_MAX_HOURS=${TOKEN_CACHE_TTL_MAX_HOURS:-10}
@@ -192,8 +259,6 @@ services:
       - ./xianyu_auto_reply/logs/backend_web:/app/backend-web/logs
       - ./xianyu_auto_reply/static:/app/static
       - ./xianyu_auto_reply/backups:/app/backups
-    ports:
-      - "${BACKEND_WEB_PORT:-8089}:8089"
     networks:
       - xianyu-network
     healthcheck:
@@ -215,10 +280,29 @@ services:
       - MYSQL_USER=${MYSQL_USER:-xianyu}
       - MYSQL_PASSWORD=${MYSQL_PASSWORD:-xianyu@2026}
       - MYSQL_DATABASE=${MYSQL_DATABASE:-xianyu_data}
+      - DB_POOL_SIZE=${WEBSOCKET_DB_POOL_SIZE:-800}
+      - DB_MAX_OVERFLOW=${WEBSOCKET_DB_MAX_OVERFLOW:-150}
+      - DB_POOL_TIMEOUT=${DB_POOL_TIMEOUT:-30}
+      - DB_POOL_RECYCLE=${DB_POOL_RECYCLE:-1800}
+      - DB_POOL_PRE_PING=${DB_POOL_PRE_PING:-true}
+      - DB_POOL_USE_LIFO=${DB_POOL_USE_LIFO:-true}
+      - DB_CONNECT_TIMEOUT=${DB_CONNECT_TIMEOUT:-10}
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-xianyu@2026}
+      - REDIS_PASSWORD=${REDIS_PASSWORD-xianyu@2026}
       - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_POOL_SIZE=${REDIS_POOL_SIZE:-800}
+      - REDIS_SOCKET_TIMEOUT=${REDIS_SOCKET_TIMEOUT:-5}
+      - REDIS_SOCKET_CONNECT_TIMEOUT=${REDIS_SOCKET_CONNECT_TIMEOUT:-3}
+      - REDIS_SOCKET_KEEPALIVE=${REDIS_SOCKET_KEEPALIVE:-true}
+      - REDIS_SOCKET_KEEPALIVE_IDLE=${REDIS_SOCKET_KEEPALIVE_IDLE:-60}
+      - REDIS_SOCKET_KEEPALIVE_INTERVAL=${REDIS_SOCKET_KEEPALIVE_INTERVAL:-10}
+      - REDIS_SOCKET_KEEPALIVE_COUNT=${REDIS_SOCKET_KEEPALIVE_COUNT:-3}
+      - REDIS_HEALTH_CHECK_INTERVAL=${REDIS_HEALTH_CHECK_INTERVAL:-30}
+      - REDIS_PROTOCOL=${REDIS_PROTOCOL:-2}
+      - REDIS_STARTUP_MAX_RETRIES=${REDIS_STARTUP_MAX_RETRIES:-5}
+      - REDIS_STARTUP_RETRY_BASE_DELAY=${REDIS_STARTUP_RETRY_BASE_DELAY:-1}
+      - REDIS_STARTUP_RETRY_CAP_DELAY=${REDIS_STARTUP_RETRY_CAP_DELAY:-10}
       - WEBSOCKET_PORT=8090
       - HOST=0.0.0.0
       - MAX_CAPTCHA_CONCURRENT=${MAX_CAPTCHA_CONCURRENT:-3}
@@ -231,6 +315,7 @@ services:
       - INTERNAL_API_TOKEN=${INTERNAL_API_TOKEN:-}
       - STATIC_DIR=/app/static
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FILE_MAX_SIZE=${LOG_FILE_MAX_SIZE:-70 MB}
       - SQL_ECHO=${SQL_ECHO:-false}
       - TOKEN_CACHE_TTL_MIN_HOURS=${TOKEN_CACHE_TTL_MIN_HOURS:-5}
       - TOKEN_CACHE_TTL_MAX_HOURS=${TOKEN_CACHE_TTL_MAX_HOURS:-10}
@@ -239,8 +324,6 @@ services:
       - ./xianyu_auto_reply/logs/websocket:/app/websocket/logs
       - ./xianyu_auto_reply/static:/app/static
       - ./xianyu_auto_reply/browser_data:/app/browser_data
-    ports:
-      - "${WEBSOCKET_PORT:-8090}:8090"
     networks:
       - xianyu-network
     depends_on:
@@ -265,10 +348,29 @@ services:
       - MYSQL_USER=${MYSQL_USER:-xianyu}
       - MYSQL_PASSWORD=${MYSQL_PASSWORD:-xianyu@2026}
       - MYSQL_DATABASE=${MYSQL_DATABASE:-xianyu_data}
+      - DB_POOL_SIZE=${SCHEDULER_DB_POOL_SIZE:-800}
+      - DB_MAX_OVERFLOW=${SCHEDULER_DB_MAX_OVERFLOW:-30}
+      - DB_POOL_TIMEOUT=${DB_POOL_TIMEOUT:-30}
+      - DB_POOL_RECYCLE=${DB_POOL_RECYCLE:-1800}
+      - DB_POOL_PRE_PING=${DB_POOL_PRE_PING:-true}
+      - DB_POOL_USE_LIFO=${DB_POOL_USE_LIFO:-true}
+      - DB_CONNECT_TIMEOUT=${DB_CONNECT_TIMEOUT:-10}
       - REDIS_HOST=${REDIS_HOST}
       - REDIS_PORT=${REDIS_PORT:-6379}
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-xianyu@2026}
+      - REDIS_PASSWORD=${REDIS_PASSWORD-xianyu@2026}
       - REDIS_DB=${REDIS_DB:-0}
+      - REDIS_POOL_SIZE=${REDIS_POOL_SIZE:-800}
+      - REDIS_SOCKET_TIMEOUT=${REDIS_SOCKET_TIMEOUT:-5}
+      - REDIS_SOCKET_CONNECT_TIMEOUT=${REDIS_SOCKET_CONNECT_TIMEOUT:-3}
+      - REDIS_SOCKET_KEEPALIVE=${REDIS_SOCKET_KEEPALIVE:-true}
+      - REDIS_SOCKET_KEEPALIVE_IDLE=${REDIS_SOCKET_KEEPALIVE_IDLE:-60}
+      - REDIS_SOCKET_KEEPALIVE_INTERVAL=${REDIS_SOCKET_KEEPALIVE_INTERVAL:-10}
+      - REDIS_SOCKET_KEEPALIVE_COUNT=${REDIS_SOCKET_KEEPALIVE_COUNT:-3}
+      - REDIS_HEALTH_CHECK_INTERVAL=${REDIS_HEALTH_CHECK_INTERVAL:-30}
+      - REDIS_PROTOCOL=${REDIS_PROTOCOL:-2}
+      - REDIS_STARTUP_MAX_RETRIES=${REDIS_STARTUP_MAX_RETRIES:-5}
+      - REDIS_STARTUP_RETRY_BASE_DELAY=${REDIS_STARTUP_RETRY_BASE_DELAY:-1}
+      - REDIS_STARTUP_RETRY_CAP_DELAY=${REDIS_STARTUP_RETRY_CAP_DELAY:-10}
       - SCHEDULER_PORT=8091
       - HOST=0.0.0.0
       - REDELIVERY_INTERVAL=${REDELIVERY_INTERVAL:-5}
@@ -279,14 +381,13 @@ services:
       - STATIC_DIR=/app/static
       - BACKUP_DIR=/app/backups
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_FILE_MAX_SIZE=${LOG_FILE_MAX_SIZE:-70 MB}
       - SQL_ECHO=${SQL_ECHO:-false}
       - TZ=Asia/Shanghai
     volumes:
       - ./xianyu_auto_reply/logs/scheduler:/app/scheduler/logs
       - ./xianyu_auto_reply/static:/app/static:ro
       - ./xianyu_auto_reply/backups:/app/backups
-    ports:
-      - "${SCHEDULER_PORT:-8091}:8091"
     networks:
       - xianyu-network
     depends_on:
@@ -309,9 +410,10 @@ services:
     environment:
       - TZ=Asia/Shanghai
     ports:
-      - "${FRONTEND_PORT:-9000}:80"
+      - "127.0.0.1:${FRONTEND_PORT:-9000}:80"
     networks:
-      - xianyu-network
+      xianyu-network:
+        ipv4_address: ${FRONTEND_IPV4_ADDRESS:-172.30.56.10}
     depends_on:
       backend-web:
         condition: service_healthy
@@ -319,6 +421,9 @@ services:
 networks:
   xianyu-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: ${XIANYU_NETWORK_SUBNET:-172.30.56.0/24}
 COMPOSEEOF
 echo -e "${GREEN}✓ docker-compose.remote.yml 已生成${NC}"
 echo ""
@@ -399,10 +504,9 @@ echo "  部署完成！"
 echo "==========================================${NC}"
 echo ""
 echo "服务访问地址："
-echo "  前端:        http://服务器IP:${frontend_port}"
-echo "  Backend-Web: http://服务器IP:${backend_web_port}"
-echo "  WebSocket:   http://服务器IP:${websocket_port}"
-echo "  Scheduler:   http://服务器IP:${scheduler_port}"
+echo "  宿主机反代目标: http://127.0.0.1:${frontend_port}"
+echo "  后端 / WebSocket / Scheduler: 仅项目容器网络访问"
+echo "  公网访问: 请通过宿主机 Nginx / 宝塔域名入口"
 echo ""
 echo "常用命令："
 echo "  查看日志: $DC_CMD logs -f"

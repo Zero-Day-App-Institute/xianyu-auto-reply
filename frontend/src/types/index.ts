@@ -14,6 +14,8 @@ export interface User {
   account_limit?: number | null
   balance?: string | null
   expire_at?: string | null
+  created_at?: string | null
+  last_login_at?: string | null
 }
 
 export interface LoginRequest {
@@ -211,6 +213,8 @@ export interface NotificationChannel {
   channel_name?: string
   channel_config?: string
   config?: Record<string, unknown>
+  config_error?: string
+  raw_config?: string
   enabled: boolean
   created_at?: string
   updated_at?: string
@@ -218,12 +222,20 @@ export interface NotificationChannel {
 
 // 消息通知相关类型 - 匹配后端接口
 // 后端返回格式: { cookie_id: [ { id, channel_id, enabled, channel_name, ... } ] }
+export type NotifyType = 'chat' | 'delivery' | 'account' | 'monitor'
+
 export interface MessageNotification {
   id: number
   cookie_id: string
   channel_id: number
   channel_name?: string
+  /** 绑定本身是否启用，与渠道总开关分开。 */
+  subscription_enabled?: boolean
+  /** 所属渠道是否启用。 */
+  channel_enabled?: boolean
   enabled: boolean
+  /** 订阅哪几类通知，缺省视为全开 */
+  notify_types?: NotifyType[]
 }
 
 // 系统设置相关类型
@@ -262,6 +274,8 @@ export type ThemeSettings = ThemeAppearanceSettings & ThemeFontSettings
 export type PasswordLoginMode = 'protocol' | 'browser'
 export type SliderMode = 'browser' | 'real_mouse'
 export type TokenApiMode = 'web' | 'remote'
+export type PaymentChannel = 'alipay' | 'zzcode'
+export type ZzcodePayType = 'alipay' | 'wxpay' | 'qqpay'
 
 export interface SystemSettings {
   ai_model?: string
@@ -287,10 +301,13 @@ export interface SystemSettings {
   'theme.font_family'?: ThemeFontFamily
   // SMTP邮件配置
   smtp_server?: string
-  smtp_port?: number
+  smtp_port?: number | string
   smtp_user?: string
   smtp_password?: string
   smtp_from?: string
+  'auth.email_allowed_suffixes'?: string
+  'auth.email_denied_suffixes'?: string
+  'auth.email_denied_message'?: string
   smtp_use_tls?: boolean
   smtp_use_ssl?: boolean
   // 模块设置
@@ -302,6 +319,14 @@ export interface SystemSettings {
   'alipay.alipay_public_key'?: string
   'alipay.gateway_url'?: string
   'alipay.notify_url'?: string
+  // 支付渠道与码支付配置
+  'payment.channel'?: PaymentChannel
+  'zzcode.pid'?: string
+  'zzcode.key'?: string
+  'zzcode.gateway'?: string
+  'zzcode.notify_url'?: string
+  'zzcode.return_url'?: string
+  'zzcode.pay_types'?: string
   // 提现配置
   'withdraw.notify_email'?: string
   'withdraw.min_amount'?: string

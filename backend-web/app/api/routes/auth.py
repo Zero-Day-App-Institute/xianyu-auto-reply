@@ -7,22 +7,27 @@
 3. 用户注册
 4. 用户登出
 """
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import deps
-from app.api.routes.captcha import check_email_code
 from app.core.security import decode_token, get_password_hash
+from app.services.auth import AuthService
+from app.services.login_flow_service import perform_login
+from app.services.registration_flow_service import perform_registration
+from app.services.system_setting_service import SystemSettingService
+from app.services.user_login_log_service import UserLoginLogService
+from app.services.user_service import UserService
 from common.models.user import User, UserRole, UserStatus
 from common.schemas.auth import LoginRequest, LoginResponse, VerifyResponse
 from common.schemas.common import ApiResponse
-from common.schemas.user import UserCreate, UserPublic
-from app.services.auth import AuthService
-from app.services.user_service import UserService
+from common.schemas.user import UserCreate
+from common.services.auth_request_validation import AuthenticationAPIRoute
+from common.services.email_verification_code_service import check_email_code
+from common.utils.http_utils import get_client_ip
 
-router = APIRouter(tags=["auth"])
-
+router = APIRouter(tags=["auth"], route_class=AuthenticationAPIRoute)
 
 class ResetPasswordRequest(BaseModel):
     """重置密码请求"""
@@ -34,78 +39,13 @@ class ResetPasswordRequest(BaseModel):
 @router.post("/login", response_model=LoginResponse)
 async def login_user(
     payload: LoginRequest,
+    request: Request,
     auth_service: AuthService = Depends(deps.get_auth_service),
     session: AsyncSession = Depends(deps.get_db_session),
+    login_log_service: UserLoginLogService = Depends(deps.get_user_login_log_service),
 ) -> LoginResponse:
-    user: User | None = None
-    error_message: str | None = None
-
-    # 检查是否启用了登录滑动验证码
-    from app.services.system_setting_service import SystemSettingService
-    setting_service = SystemSettingService(session)
-    all_settings = await setting_service.list_settings()
-    captcha_enabled_str = all_settings.get("login_captcha_enabled")
-    captcha_enabled = captcha_enabled_str in (None, "true", "1")  # 默认开启
-
-    # 账号密码登录和邮箱密码登录需要验证滑动验证码
-    if payload.username and payload.password:
-        # 账号密码登录 - 需要滑动验证（如果开启）
-        if captcha_enabled:
-            from app.api.routes.geetest import check_geetest_verified
-            
-            if not payload.geetest_challenge:
-                return LoginResponse(success=False, message="请完成滑动验证")
-            
-            geetest_ok, geetest_msg = check_geetest_verified(payload.geetest_challenge)
-            if not geetest_ok:
-                return LoginResponse(success=False, message=geetest_msg)
-        
-        user, error_message = await auth_service.authenticate_by_username(payload.username, payload.password)
-    elif payload.email and payload.password:
-        # 邮箱密码登录 - 需要滑动验证（如果开启）
-        if captcha_enabled:
-            from app.api.routes.geetest import check_geetest_verified
-            
-            if not payload.geetest_challenge:
-                return LoginResponse(success=False, message="请完成滑动验证")
-            
-            geetest_ok, geetest_msg = check_geetest_verified(payload.geetest_challenge)
-            if not geetest_ok:
-                return LoginResponse(success=False, message=geetest_msg)
-        
-        user, error_message = await auth_service.authenticate_by_email(payload.email, payload.password)
-    elif payload.email and payload.verification_code:
-        # 邮箱验证码登录
-        # 验证验证码
-        code_valid, code_msg = check_email_code(payload.email, payload.verification_code, "login")
-        if not code_valid:
-            return LoginResponse(success=False, message=code_msg)
-        
-        # 根据邮箱查找用户
-        user_service = UserService(session)
-        user = await user_service.get_by_email(payload.email)
-        if not user:
-            return LoginResponse(success=False, message="该邮箱未注册")
-    else:
-        return LoginResponse(success=False, message="请提供有效的登录信息")
-
-    if not user:
-        return LoginResponse(success=False, message=error_message or "登录失败")
-
-    if user.status != UserStatus.ACTIVE:
-        return LoginResponse(success=False, message="账号已禁用，请联系管理员")
-
-    await auth_service.mark_login(user)
-    return LoginResponse(
-        success=True,
-        message="登录成功",
-        token=auth_service.create_access_token(user),
-        refresh_token=auth_service.create_refresh_token(user),
-        user_id=user.id,
-        username=user.username,
-        is_admin=user.role == UserRole.ADMIN,
-        account_limit=user.account_limit,
-    )
+    """调用统一登录流程，先校验后缀与限流，再认证并提交审计日志。"""
+    return await perform_login(payload, get_client_ip(request), auth_service, session, login_log_service)
 
 
 @router.get("/verify", response_model=VerifyResponse)
@@ -204,33 +144,25 @@ async def check_default_password(
     )
 
 
-@router.post("/register", response_model=ApiResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/register", response_model=ApiResponse)
 async def register_user(
     payload: UserCreate,
+    request: Request,
     user_service: UserService = Depends(deps.get_user_service),
+    setting_service: SystemSettingService = Depends(deps.get_system_setting_service),
 ) -> ApiResponse:
-    # 验证邮箱验证码
-    if payload.email and payload.verification_code:
-        code_valid, code_msg = check_email_code(payload.email, payload.verification_code, "register")
-        if not code_valid:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=code_msg)
-    elif payload.email:
-        # 有邮箱但没有验证码
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请输入邮箱验证码")
-    
-    # 检查用户名是否已存在
-    existing = await user_service.get_by_username(payload.username)
-    if existing:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已被注册")
-    
-    # 检查邮箱是否已存在
-    if payload.email:
-        existing_email = await user_service.get_by_email(payload.email)
-        if existing_email:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="邮箱已被注册")
-    
-    await user_service.create(payload)
-    return ApiResponse(success=True, message="注册成功")
+    """按当前注册开关与邮箱验证码创建用户。
+
+    Args:
+        payload: 用户注册资料与邮箱验证码。
+        request: 请求对象，用于公共客户端 IP 获取与注册限流。
+        user_service: 用户查询与创建服务。
+        setting_service: 读取当前注册开关的设置服务。
+    Returns:
+        统一业务响应，关闭注册时不消费验证码或创建账号。
+    """
+    request.state.registration_started = True
+    return await perform_registration(payload, get_client_ip(request), user_service, setting_service)
 
 
 @router.post("/reset-password", response_model=ApiResponse)
