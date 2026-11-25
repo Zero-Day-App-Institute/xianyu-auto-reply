@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, time
 
 from sqlalchemy import or_, select
 
@@ -16,7 +15,7 @@ from common.models.security_task import (
     SECURITY_TASK_CODE,
     SecurityTask,
 )
-from common.services.registration_log_query_service import _parse_date
+from common.utils.date_filters import date_range_conditions
 from common.utils.pagination import execute_paginated_with_filters
 from common.utils.time_utils import get_beijing_now_naive, safe_isoformat
 
@@ -58,13 +57,7 @@ class SecurityQueryService:
             filters.append(SecurityLog.execution_method == execution_method)
         if result:
             filters.append(SecurityLog.result == result)
-        start, end = _parse_date(start_date, '开始日期'), _parse_date(end_date, '结束日期')
-        if start and end and start > end:
-            raise ValueError('开始日期不能晚于结束日期')
-        if start:
-            filters.append(SecurityLog.started_at >= start)
-        if end:
-            filters.append(SecurityLog.started_at <= datetime.combine(end.date(), time.max))
+        filters.extend(date_range_conditions(SecurityLog.started_at, start_date, end_date))
         rows, total = await execute_paginated_with_filters(self.session, SecurityLog, filters=filters,
             order_by=[SecurityLog.started_at.desc(), SecurityLog.id.desc()], page=page, page_size=page_size)
         return {'items': [self.serialize_log(item) for item in rows], 'total': total, 'page': page,
@@ -103,7 +96,8 @@ class SecurityQueryService:
         return {
             'id': schedule.id, 'task_code': schedule.task_code, 'interval_seconds': schedule.interval_seconds,
             'enabled': bool(schedule.enabled),
-            'next_run_at': safe_isoformat(row.next_run_at) if schedule.enabled else None,
+            # 兼容旧字段；原调度器采用间隔循环，旧持久化时间不再是运行来源。
+            'next_run_at': None,
             'last_run_at': safe_isoformat(row.last_run_at),
             'last_result': row.last_result, 'last_message': row.last_message,
             'running': bool(row.lease_id and row.lease_expires_at and row.lease_expires_at > now),
